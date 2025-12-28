@@ -5,3 +5,21 @@
 tags
 node_modules
 __pycache__
+# Test/Development files
+*.log
+*.sql
+*.dump
+test_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ERPNext
+sites/
