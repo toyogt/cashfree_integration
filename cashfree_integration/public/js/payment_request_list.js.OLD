@@ -1,0 +1,291 @@
+// payment_request_list.js
+frappe.listview_settings['Payment Request'] = {
+    onload: function(listview) {
+        
+        // ====== BULK VERIFY REQUEST ======
+        listview.page.add_action_item(__("Bulk Verify Request"), function() {
+            let selected = listview.get_checked_items();
+            if (selected.length === 0) {
+                frappe.msgprint(__("Please select Payment Requests to verify"));
+                return;
+            }
+            
+            frappe.confirm(
+                `Verify ${selected.length} Payment Request(s)?<br><br>This will change state to "Verified"`,
+                () => {
+                    frappe.call({
+                        method: "cashfree_integration.api.bulk_actions.bulk_verify_requests",
+                        args: {
+                            payment_requests: selected.map(d => d.name)
+                        },
+                        freeze: true,
+                        freeze_message: __("Verifying Payment Requests..."),
+                        callback: function(r) {
+                            if (!r.exc) {
+                                frappe.show_alert({
+                                    message: __(r.message),
+                                    indicator: "green"
+                                });
+                                listview.refresh();
+                            }
+                        }
+                    });
+                }
+            );
+        });
+        
+        // ====== BULK APPROVE PAYMENT ======
+        listview.page.add_action_item(__("Bulk Approve Payment"), function() {
+            let selected = listview.get_checked_items();
+            if (selected.length === 0) {
+                frappe.msgprint(__("Please select Payment Requests to approve"));
+                return;
+            }
+            
+            frappe.confirm(
+                `Approve ${selected.length} Payment Request(s)?<br><br>This will change state to "Approved"`,
+                () => {
+                    frappe.call({
+                        method: "cashfree_integration.api.bulk_actions.bulk_approve_payments",
+                        args: {
+                            payment_requests: selected.map(d => d.name)
+                        },
+                        freeze: true,
+                        freeze_message: __("Approving Payment Requests..."),
+                        callback: function(r) {
+                            if (!r.exc) {
+                                frappe.show_alert({
+                                    message: __(r.message),
+                                    indicator: "green"
+                                });
+                                listview.refresh();
+                            }
+                        }
+                    });
+                }
+            );
+        });
+        
+        // ====== BULK QUEUE FOR PAYOUT (WITH 2FA + MODE VALIDATION) ======
+        listview.page.add_action_item(__("Bulk Queue for Payout"), function() {
+            let selected = listview.get_checked_items();
+            if (selected.length === 0) {
+                frappe.msgprint(__("Please select approved Payment Requests"));
+                return;
+            }
+            
+            // Show 2FA dialog with mode selection
+            let d = new frappe.ui.Dialog({
+                title: __("Bulk Queue for Payout"),
+                fields: [
+                    {
+                        fieldname: "info_html",
+                        fieldtype: "HTML",
+                        options: `
+                            <div class="alert alert-info">
+                                <b>Selected:</b> ${selected.length} Payment Request(s)<br>
+                                <b>Action:</b> Queue for payout to Cashfree<br><br>
+                                Please authenticate to proceed.
+                            </div>
+                        `
+                    },
+                    {
+                        fieldname: "transfer_mode",
+                        fieldtype: "Select",
+                        label: "Transfer Mode",
+                        options: "\nNEFT\nRTGS\nIMPS\nUPI",
+                        reqd: 1,
+                        default: "NEFT",
+                        description: "Select payout transfer mode"
+                    },
+                    {
+                        fieldname: "password",
+                        fieldtype: "Password",
+                        label: "Your Password (2FA)",
+                        reqd: 1,
+                        description: "Enter your password to authenticate bulk payout"
+                    }
+                ],
+                primary_action_label: __("Queue Payouts"),
+                primary_action: function(values) {
+                    if (!values.password) {
+                        frappe.msgprint(__("Password is required for bulk payout"));
+                        return;
+                    }
+                    
+                    if (!values.transfer_mode) {
+                        frappe.msgprint(__("Please select transfer mode"));
+                        return;
+                    }
+                    
+                    d.hide();
+                    
+                    frappe.call({
+                        method: "cashfree_integration.api.bulk_actions.bulk_queue_payouts",
+                        args: {
+                            payment_requests: selected.map(d => d.name),
+                            password: values.password,
+                            transfer_mode: values.transfer_mode
+                        },
+                        freeze: true,
+                        freeze_message: __("Queuing Payouts..."),
+                        callback: function(r) {
+                            if (!r.exc) {
+                                // Show detailed results
+                                let results = r.message;
+                                let success_count = results.success.length;
+                                let failed_count = results.failed.length;
+                                let skipped_count = results.skipped.length;
+                                
+                                let msg = `<b>Bulk Payout Results:</b><br><br>`;
+                                msg += `✅ Success: ${success_count}<br>`;
+                                msg += `❌ Failed: ${failed_count}<br>`;
+                                msg += `⚠️ Skipped: ${skipped_count}<br><br>`;
+                                
+                                if (failed_count > 0) {
+                                    msg += `<b>Failed:</b><br>`;
+                                    results.failed.forEach(f => {
+                                        msg += `- ${f.name}: ${f.error}<br>`;
+                                    });
+                                }
+                                
+                                if (skipped_count > 0) {
+                                    msg += `<br><b>Skipped:</b><br>`;
+                                    results.skipped.forEach(s => {
+                                        msg += `- ${s.name}: ${s.reason}<br>`;
+                                    });
+                                }
+                                
+                                frappe.msgprint({
+                                    title: __("Bulk Payout Complete"),
+                                    message: msg,
+                                    indicator: success_count > 0 ? "green" : "orange"
+                                });
+                                
+                                listview.refresh();
+                            }
+                        }
+                    });
+                }
+            });
+            
+            d.show();
+        });
+        
+        // ====== BULK RETRY PAYOUT ======
+        listview.page.add_action_item(__("Bulk Retry Payout"), function() {
+            let selected = listview.get_checked_items();
+            if (selected.length === 0) {
+                frappe.msgprint(__("Please select failed Payment Requests to retry"));
+                return;
+            }
+            
+            // Show 2FA dialog for retry
+            let d = new frappe.ui.Dialog({
+                title: __("Bulk Retry Failed Payouts"),
+                fields: [
+                    {
+                        fieldname: "info_html",
+                        fieldtype: "HTML",
+                        options: `
+                            <div class="alert alert-warning">
+                                <b>Selected:</b> ${selected.length} Payment Request(s)<br>
+                                <b>Action:</b> Retry failed payouts<br><br>
+                                ⚠️ Only failed/rejected payouts will be retried.<br>
+                                Please authenticate to proceed.
+                            </div>
+                        `
+                    },
+                    {
+                        fieldname: "password",
+                        fieldtype: "Password",
+                        label: "Your Password (2FA)",
+                        reqd: 1,
+                        description: "Enter your password to authenticate bulk retry"
+                    }
+                ],
+                primary_action_label: __("Retry Payouts"),
+                primary_action: function(values) {
+                    if (!values.password) {
+                        frappe.msgprint(__("Password is required for bulk retry"));
+                        return;
+                    }
+                    
+                    d.hide();
+                    
+                    frappe.call({
+                        method: "cashfree_integration.api.bulk_actions.bulk_retry_payouts",
+                        args: {
+                            payment_requests: selected.map(d => d.name),
+                            password: values.password
+                        },
+                        freeze: true,
+                        freeze_message: __("Retrying Failed Payouts..."),
+                        callback: function(r) {
+                            if (!r.exc) {
+                                let results = r.message;
+                                let success_count = results.success.length;
+                                let failed_count = results.failed.length;
+                                let skipped_count = results.skipped.length;
+                                
+                                let msg = `<b>Bulk Retry Results:</b><br><br>`;
+                                msg += `✅ Retried: ${success_count}<br>`;
+                                msg += `❌ Failed: ${failed_count}<br>`;
+                                msg += `⚠️ Skipped: ${skipped_count}<br><br>`;
+                                
+                                if (failed_count > 0) {
+                                    msg += `<b>Failed:</b><br>`;
+                                    results.failed.forEach(f => {
+                                        msg += `- ${f.name}: ${f.error}<br>`;
+                                    });
+                                }
+                                
+                                if (skipped_count > 0) {
+                                    msg += `<br><b>Skipped (not failed status):</b><br>`;
+                                    results.skipped.forEach(s => {
+                                        msg += `- ${s.name}: ${s.reason}<br>`;
+                                    });
+                                }
+                                
+                                frappe.msgprint({
+                                    title: __("Bulk Retry Complete"),
+                                    message: msg,
+                                    indicator: success_count > 0 ? "green" : "orange"
+                                });
+                                
+                                listview.refresh();
+                            }
+                        }
+                    });
+                }
+            });
+            
+            d.show();
+        });
+    },
+    
+    // Add custom indicator for list view
+    get_indicator: function(doc) {
+        let state = doc.workflow_state;
+        let recon = doc.custom_reconciliation_status;
+        
+        // Priority: Reconciliation status > Workflow state
+        if (recon === "Success") {
+            return [__("Paid"), "green", "custom_reconciliation_status,=,Success"];
+        } else if (recon === "Failed") {
+            return [__("Failed"), "red", "custom_reconciliation_status,=,Failed"];
+        } else if (recon === "Pending") {
+            return [__("Processing"), "orange", "custom_reconciliation_status,=,Pending"];
+        } else if (state === "Approved") {
+            return [__("Approved"), "blue", "workflow_state,=,Approved"];
+        } else if (state === "Verified") {
+            return [__("Verified"), "cyan", "workflow_state,=,Verified"];
+        } else if (state === "Queued") {
+            return [__("Queued"), "purple", "workflow_state,=,Queued"];
+        } else if (state === "Draft") {
+            return [__("Draft"), "gray", "workflow_state,=,Draft"];
+        }
+        
+        return [__(state), "gray", "workflow_state,=," + state];
+    }
+};
