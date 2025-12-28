@@ -5,3 +5,18 @@
 tags
 node_modules
 __pycache__
+# Credentials and secrets
+*credentials*
+*secrets*
+*.pem
+*.key
+config.json
+site_config.json
+
+# Environment files
+.env
+.env.local
+
+# IDE files
+.vscode/
+.idea/
