@@ -1,0 +1,145 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-01-02 12:41:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "environment",
+  "section_break_credentials",
+  "client_id",
+  "client_secret",
+  "column_break_api",
+  "enable_payout",
+  "enable_verification",
+  "section_break_urls",
+  "payout_sandbox_url",
+  "payout_production_url",
+  "column_break_verification",
+  "verification_sandbox_url",
+  "verification_production_url",
+  "column_break_remarks",
+  "payout_remarks_prefix"
+ ],
+ "fields": [
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  },
+  {
+   "default": "sandbox",
+   "fieldname": "environment",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Environment",
+   "options": "sandbox\nproduction",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_break_credentials",
+   "fieldtype": "Section Break",
+   "label": "API Credentials"
+  },
+  {
+   "fieldname": "client_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Client ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "client_secret",
+   "fieldtype": "Password",
+   "label": "Client Secret",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_api",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_payout",
+   "fieldtype": "Check",
+   "label": "Enable Payout API"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_verification",
+   "fieldtype": "Check",
+   "label": "Enable Bank Verification"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "section_break_urls",
+   "fieldtype": "Section Break",
+   "label": "API URLs (Advanced)"
+  },
+  {
+   "default": "https://sandbox.cashfree.com/payout",
+   "fieldname": "payout_sandbox_url",
+   "fieldtype": "Data",
+   "label": "Payout Sandbox URL"
+  },
+  {
+   "default": "https://api.cashfree.com/payout",
+   "fieldname": "payout_production_url",
+   "fieldtype": "Data",
+   "label": "Payout Production URL"
+  },
+  {
+   "fieldname": "column_break_verification",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "https://sandbox.cashfree.com/verification",
+   "fieldname": "verification_sandbox_url",
+   "fieldtype": "Data",
+   "label": "Verification Sandbox URL"
+  },
+  {
+   "default": "https://api.cashfree.com/verification",
+   "fieldname": "verification_production_url",
+   "fieldtype": "Data",
+   "label": "Verification Production URL"
+  },
+  {
+   "fieldname": "column_break_remarks",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "TK",
+   "fieldname": "payout_remarks_prefix",
+   "fieldtype": "Data",
+   "label": "Payout Remarks Prefix",
+   "description": "Prefix for payout remarks (e.g., 'TK' will show as 'TK PR-00001')"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-01-02 16:33:00.000000",
+ "modified_by": "Administrator",
+ "module": "Cashfree Integration",
+ "name": "Cashfree Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
