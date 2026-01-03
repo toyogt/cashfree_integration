@@ -1,4 +1,5 @@
-# File: cashfree_integration/api/webhooks.py
+# File: cashfree_integration/api/webhook.py
+# NOTE: File should be webhook.py (singular), not webhooks.py
 
 import frappe
 import json
@@ -109,7 +110,7 @@ def cashfree_payout_webhook():
                 response_payload = %s,
                 modified = NOW()
             WHERE payment_request = %s
-        """, (status, json.dumps(transfer_data), transfer_id))
+        """, (new_status, json.dumps(transfer_data), transfer_id))
         
         # ✅ AUTO-CREATE PAYMENT ENTRY AS DRAFT ON SUCCESS
         pe_created = None
@@ -155,7 +156,14 @@ def verify_cashfree_signature(data, signature):
     """
     try:
         settings = frappe.get_single("Cashfree Settings")
-        secret = settings.get_password("client_secret")
+        
+        # FIXED: Use get_password correctly
+        from frappe.utils.password import get_decrypted_password
+        secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
+        
+        if not secret:
+            frappe.log_error("Client secret not found", "Webhook Signature Error")
+            return False
         
         # Cashfree sends timestamp in data
         timestamp = str(data.get("timestamp", ""))
@@ -197,7 +205,7 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
         "Payment Request",
         payment_request_name,
         ["party_type", "party", "grand_total", "company", "currency", "cost_center",
-         "reference_doctype", "reference_name"],
+         "reference_doctype", "reference_name", "mode_of_payment"],
         as_dict=True
     )
     
@@ -211,10 +219,7 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     })
     
     if existing_pe:
-        frappe.log_error(
-            f"Payment Entry already exists: {existing_pe}",
-            "Webhook - Duplicate PE Prevention"
-        )
+        frappe.logger().info(f"Payment Entry already exists: {existing_pe}")
         return existing_pe
     
     # ✅ CREATE PAYMENT ENTRY (DRAFT)
@@ -227,8 +232,8 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     pe.company = pr.company
     pe.posting_date = frappe.utils.today()
     
-    # Set Mode of Payment = Cashfree
-    pe.mode_of_payment = "Cashfree"
+    # Set Mode of Payment
+    pe.mode_of_payment = pr.mode_of_payment or "Bank Transfer"
     
     # Set Paid From account (Cashfree - Company)
     cashfree_account = get_cashfree_bank_account(pr.company)
@@ -333,10 +338,7 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
         except Exception as ref_error:
             # Don't fail PE creation if reference allocation fails
             allocation_note = f"\n❌ Reference allocation failed: {str(ref_error)}\nPayment recorded as advance - manual allocation required."
-            frappe.log_error(
-                f"Reference allocation error for {pr.reference_name}: {str(ref_error)}\n{frappe.get_traceback()}",
-                "Webhook - Reference Allocation Failed"
-            )
+            frappe.logger().error(f"Reference allocation error: {str(ref_error)}")
     
     # Enhanced remarks with allocation details
     pe.remarks = (
@@ -357,16 +359,9 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     pe.flags.ignore_mandatory = True
     pe.insert()
     
-    # Enhanced logging
-    frappe.log_error(
-        f"✅ Payment Entry {pe.name} created as DRAFT for PR {payment_request_name}\n"
-        f"UTR: {utr}\n"
-        f"Amount: ₹{pr.grand_total}\n"
-        f"Party: {pr.party}\n"
-        f"Reference Allocated: {reference_allocated}\n"
-        f"{allocation_note}\n"
-        f"⚠️ REQUIRES MANUAL REVIEW AND SUBMISSION",
-        "Webhook - PE Created (Draft)"
+    # Log PE creation
+    frappe.logger().info(
+        f"✅ Payment Entry {pe.name} created as DRAFT for PR {payment_request_name}"
     )
     
     # Notify accountant
@@ -375,9 +370,9 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     except:
         pass  # Don't fail if notification fails
     
-    # ✅ NEW: Notify vendor about payment
+    # ✅ Notify vendor about payment
     try:
-        send_payment_notification_to_vendor(pe.name, utr, pr.grand_total)
+        send_payment_notification_to_vendor(pe.name, pr.party, utr, pr.grand_total)
     except:
         pass  # Don't fail if email fails
     
@@ -428,14 +423,9 @@ def get_cashfree_bank_account(company):
     if accounts:
         return accounts[0].name
     
-    # Not found
-    frappe.log_error(
-        f"Cashfree bank account not found for company: {company}\n"
-        f"Please create an Account with:\n"
-        f"- Account Name: Cashfree - {company_abbr}\n"
-        f"- Account Type: Bank\n"
-        f"- Is Group: No",
-        "Webhook - Bank Account Missing"
+    # Not found - log error
+    frappe.logger().error(
+        f"Cashfree bank account not found for company: {company}"
     )
     
     return None
@@ -462,7 +452,7 @@ def notify_accountant_for_review(pe_name, pr_name, utr, amount):
             frappe.publish_realtime(
                 event='msgprint',
                 message=f'<b>Payment Entry Created</b><br><br>'
-                        f'A new Payment Entry <b>{pe_name}</b> has been created from Cashfree webhook.<br><br>'
+                        f'A new Payment Entry <b>{pe.name}</b> has been created from Cashfree webhook.<br><br>'
                         f'<b>Details:</b><br>'
                         f'Payment Request: {pr_name}<br>'
                         f'UTR: {utr}<br>'
@@ -474,12 +464,13 @@ def notify_accountant_for_review(pe_name, pr_name, utr, amount):
         pass  # Fail silently
 
 
-def send_payment_notification_to_vendor(pe_name, utr, amount):
+def send_payment_notification_to_vendor(pe_name, party, utr, amount):
     """
-    ✅ NEW FUNCTION: Send email notification to vendor about payment
+    ✅ Send email notification to vendor about payment
     
     Args:
         pe_name: Payment Entry name
+        party: Supplier name
         utr: UTR number
         amount: Payment amount
     
@@ -489,14 +480,21 @@ def send_payment_notification_to_vendor(pe_name, utr, amount):
     try:
         pe = frappe.get_doc("Payment Entry", pe_name)
         
-        # Get supplier email
-        supplier_email = frappe.db.get_value("Supplier", pe.party, "email_id")
+        # FIXED: Get supplier email with fallback
+        supplier_email = frappe.db.get_value("Supplier", party, "email_id")
         
         if not supplier_email:
-            frappe.log_error(
-                f"No email found for supplier {pe.party}",
-                "Vendor Email Missing"
-            )
+            # Try to get from contact
+            contact = frappe.db.get_value("Dynamic Link", {
+                "link_doctype": "Supplier",
+                "link_name": party
+            }, "parent")
+            
+            if contact:
+                supplier_email = frappe.db.get_value("Contact", contact, "email_id")
+        
+        if not supplier_email:
+            frappe.logger().info(f"No email found for supplier {party}")
             return False
         
         # Email subject
@@ -507,7 +505,7 @@ def send_payment_notification_to_vendor(pe_name, utr, amount):
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2e7d32;">Payment Processed Successfully</h2>
             
-            <p>Dear <strong>{pe.party}</strong>,</p>
+            <p>Dear <strong>{party}</strong>,</p>
             
             <p>We are pleased to inform you that your payment has been processed successfully through Cashfree.</p>
             
@@ -554,23 +552,18 @@ def send_payment_notification_to_vendor(pe_name, utr, amount):
             message=message,
             reference_doctype="Payment Entry",
             reference_name=pe.name,
-            now=True  # Send immediately
+            now=False  # FIXED: Queue email instead of sending immediately
         )
         
-        # Log success
-        frappe.log_error(
-            f"✅ Payment notification sent to {supplier_email}\n"
-            f"PE: {pe.name}\n"
-            f"Amount: ₹{amount}\n"
-            f"UTR: {utr}",
-            "Vendor Payment Notification Sent"
+        # Log success (use logger instead of error log)
+        frappe.logger().info(
+            f"✅ Payment notification queued for {supplier_email} (PE: {pe.name})"
         )
         
         return True
         
     except Exception as e:
-        frappe.log_error(
-            f"Failed to send email for PE {pe_name}: {str(e)}\n{frappe.get_traceback()}",
-            "Vendor Email Failed"
+        frappe.logger().error(
+            f"Failed to send email for PE {pe_name}: {str(e)}"
         )
         return False
