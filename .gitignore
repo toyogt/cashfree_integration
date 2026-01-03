@@ -20,3 +20,10 @@ site_config.json
 # IDE files
 .vscode/
 .idea/
+*.log
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+*.swp
+.env
