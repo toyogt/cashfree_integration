@@ -1,12 +1,14 @@
 # File: payouts.py
-# Cashfree Payout Integration V2 with Bank Verification + Director Override
-# Updated to use centralized API Manager
+# Cashfree Payout Integration V3 - Complete Fix with Beneficiary Handling
+# Updated to use centralized API Manager with proper error handling
+
 
 import frappe
 import traceback
 import time
 from frappe.utils import now
 from cashfree_integration.api_manager import CashfreeAPIManager
+
 
 def log_message(data, title="Cashfree Payout Log"):
     """Helper to log messages to Error Log"""
@@ -15,6 +17,7 @@ def log_message(data, title="Cashfree Payout Log"):
     except Exception:
         text = str(data)
     frappe.log_error(text, title)
+
 
 def get_contact_details_from_bank(bank):
     """Extract email and phone from linked Contact"""
@@ -51,6 +54,7 @@ def get_contact_details_from_bank(bank):
     
     return email, phone
 
+
 def get_party_name_from_bank(bank):
     """Get party name for beneficiary"""
     if bank.party:
@@ -67,10 +71,15 @@ def get_party_name_from_bank(bank):
     
     return bank.account_name or bank.party or ""
 
+
 def generate_beneficiary_id(bank):
-    """Generate consistent beneficiary_id"""
+    """
+    Generate consistent beneficiary_id (max 50 chars)
+    Format: BENE_PartyName_AcctLast4
+    """
     party_name = get_party_name_from_bank(bank)
     
+    # Clean party name
     party_clean = party_name.replace(" ", "_").replace("-", "_")
     party_clean = "".join(c for c in party_clean if c.isalnum() or c == "_")
     
@@ -78,30 +87,40 @@ def generate_beneficiary_id(bank):
         party_clean = party_clean.replace("__", "_")
     
     party_clean = party_clean.strip("_")
-    party_clean = party_clean[:20]
+    party_clean = party_clean[:30]  # Limit to 30 chars
     
     if not party_clean:
         party_clean = "UNKNOWN"
     
+    # Get last 4 digits of account
     account_suffix = bank.bank_account_no[-4:] if bank.bank_account_no else "0000"
     
+    # Format: BENE_Name_1234 (max 50 chars)
     bene_id = f"BENE_{party_clean}_{account_suffix}"
     
     return bene_id[:50]
 
+
 def create_or_get_beneficiary(bank, cf_manager):
     """
     Create or get existing beneficiary using API Manager
-    
-    CHANGE: Uses centralized API Manager
+    Handles conflicts gracefully
     """
+    # Generate beneficiary ID
     bene_id = generate_beneficiary_id(bank)
     
     # Check if already stored in Bank Account
     existing_bene = bank.get("custom_cashfree_beneficiary_id")
     if existing_bene:
         frappe.logger().info(f"Using existing beneficiary: {existing_bene}")
-        return existing_bene
+        
+        # Verify it exists in Cashfree
+        try:
+            verify_response = cf_manager.get_beneficiary(existing_bene)
+            if verify_response.get("data"):
+                return existing_bene
+        except:
+            frappe.logger().warning(f"Stored beneficiary {existing_bene} not found in Cashfree, creating new")
     
     # Get contact details
     email, phone = get_contact_details_from_bank(bank)
@@ -115,9 +134,11 @@ def create_or_get_beneficiary(bank, cf_manager):
     
     # Create beneficiary using API Manager
     try:
+        frappe.logger().info(f"Creating beneficiary: {bene_id} for {party_name}")
+        
         result = cf_manager.create_beneficiary(
             bene_id=bene_id,
-            name=party_name,
+            name=party_name[:100],  # Max 100 chars
             email=email or "default@example.com",
             phone=phone or "9999999999",
             bank_account=bank.bank_account_no or "",
@@ -130,7 +151,7 @@ def create_or_get_beneficiary(bank, cf_manager):
         
         log_message(
             {"result": result, "bene_id": bene_id},
-            "Cashfree Beneficiary Created"
+            "Cashfree Beneficiary Created/Retrieved"
         )
         
         # Store beneficiary ID in Bank Account
@@ -143,42 +164,32 @@ def create_or_get_beneficiary(bank, cf_manager):
         )
         frappe.db.commit()
         
+        frappe.logger().info(f"✅ Beneficiary ready: {bene_id}")
+        
         return bene_id
         
     except Exception as e:
         error_msg = str(e)
         
-        # Handle duplicate beneficiary
-        if "already exists" in error_msg.lower() or "conflict" in error_msg.lower():
-            frappe.logger().info(f"Beneficiary already exists: {bene_id}")
-            frappe.db.set_value(
-                "Bank Account", 
-                bank.name, 
-                "custom_cashfree_beneficiary_id", 
-                bene_id, 
-                update_modified=False
-            )
-            frappe.db.commit()
-            return bene_id
-        
-        # Log and re-raise other errors
         log_message(
-            {"error": error_msg, "bene_id": bene_id, "traceback": traceback.format_exc()},
-            "Cashfree Beneficiary Creation Error"
+            {"error": error_msg, "bene_id": bene_id, "bank": bank.name, "traceback": traceback.format_exc()},
+            "Cashfree Beneficiary Error"
         )
-        raise
+        
+        raise Exception(f"Beneficiary creation failed: {error_msg}")
+
 
 def initiate_payout(doc, amount, bene_id, cf_manager, settings):
     """
     Initiate payout using API Manager
-    
-    CHANGE: Uses centralized API Manager with beneficiary_id reference
     """
     try:
         # Get remarks
         remarks = f"{getattr(settings, 'payout_remarks_prefix', 'TK')} {doc.name}"
         
         # Create transfer using API Manager
+        frappe.logger().info(f"Initiating transfer: {doc.name} to {bene_id} for ₹{amount}")
+        
         result = cf_manager.create_transfer(
             bene_id=bene_id,
             amount=amount,
@@ -191,9 +202,12 @@ def initiate_payout(doc, amount, bene_id, cf_manager, settings):
             "Cashfree Transfer Success"
         )
         
-        # Extract data from response
-        payout_id = result.get("cf_transfer_id") or result.get("transfer_id")
-        raw_status = result.get("transfer_status") or result.get("status") or "PENDING"
+        # Extract data from response (V2 API format)
+        data = result.get("data", {})
+        transfer_details = data.get("transfer_details", {})
+        
+        payout_id = transfer_details.get("transfer_id") or doc.name
+        raw_status = transfer_details.get("transfer_status") or data.get("status") or "PENDING"
         
         # Map status
         status_mapping = {
@@ -208,11 +222,13 @@ def initiate_payout(doc, amount, bene_id, cf_manager, settings):
         }
         status = status_mapping.get(str(raw_status).upper(), "Pending")
         
+        frappe.logger().info(f"✅ Transfer initiated: {payout_id} - Status: {status}")
+        
         return payout_id, status, result
         
     except Exception as e:
         log_message(
-            {"exception": str(e), "traceback": traceback.format_exc(), "pr": doc.name},
+            {"exception": str(e), "traceback": traceback.format_exc(), "pr": doc.name, "bene_id": bene_id},
             "Cashfree Transfer Error"
         )
         raise
@@ -221,13 +237,12 @@ def initiate_payout(doc, amount, bene_id, cf_manager, settings):
 def trigger_payout_for_payment_request(doc, method=None):
     """
     Triggered when Payment Request updates
-    
-    CHANGE: Uses centralized API Manager
+    Main entry point for payout processing
     """
     
     log_message(
         {"pr": doc.name, "workflow_state": doc.workflow_state, "method": method},
-        "Cashfree Trigger Start V2"
+        "Cashfree Trigger Start V3"
     )
     
     state = (doc.workflow_state or "").strip().lower()
@@ -386,7 +401,7 @@ def trigger_payout_for_payment_request(doc, method=None):
         except Exception as e:
             frappe.logger().error(f"Error checking PO: {str(e)}")
     
-    # CHANGE: Initialize API Manager
+    # Initialize API Manager
     try:
         cf_manager = CashfreeAPIManager()
         settings = cf_manager.settings
@@ -397,12 +412,13 @@ def trigger_payout_for_payment_request(doc, method=None):
     # Create/get beneficiary
     try:
         bene_id = create_or_get_beneficiary(bank, cf_manager)
-        frappe.logger().info(f"Beneficiary ready: {bene_id}")
+        frappe.logger().info(f"✅ Beneficiary ready: {bene_id}")
     except Exception as e:
-        log_message({"error": "Beneficiary failed", "pr": doc.name, "exception": str(e)}, "Cashfree Beneficiary Failed")
+        log_message({"error": "Beneficiary failed", "pr": doc.name, "bank": bank.name, "exception": str(e)}, "Cashfree Beneficiary Failed")
         frappe.throw(f"Beneficiary creation failed: {str(e)}")
     
-    time.sleep(1)
+    # Small delay to ensure beneficiary is ready
+    time.sleep(2)
     
     # Initiate payout
     try:
@@ -445,6 +461,6 @@ def trigger_payout_for_payment_request(doc, method=None):
             title='Payout Success'
         )
         
-        log_message({"pr": doc.name, "payout_id": payout_id, "status": status}, "Cashfree Payout Success")
+        log_message({"pr": doc.name, "payout_id": payout_id, "status": status, "bene_id": bene_id}, "Cashfree Payout Success")
     except Exception as e:
         log_message({"error": "PR update failed", "pr": doc.name, "exception": str(e)}, "Cashfree PR Update Error")

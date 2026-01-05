@@ -1,7 +1,7 @@
 {
  "actions": [],
  "allow_rename": 1,
- "creation": "2026-01-02 12:41:00.000000",
+ "creation": "2026-01-02 12:41:00",
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
@@ -20,7 +20,10 @@
   "verification_sandbox_url",
   "verification_production_url",
   "column_break_remarks",
-  "payout_remarks_prefix"
+  "payout_remarks_prefix",
+  "payout_credentials_section",
+  "payout_client_id",
+  "payout_client_secret"
  ],
  "fields": [
   {
@@ -112,18 +115,36 @@
   },
   {
    "default": "TK",
+   "description": "Prefix for payout remarks (e.g., 'TK' will show as 'TK PR-00001')",
    "fieldname": "payout_remarks_prefix",
    "fieldtype": "Data",
-   "label": "Payout Remarks Prefix",
-   "description": "Prefix for payout remarks (e.g., 'TK' will show as 'TK PR-00001')"
+   "label": "Payout Remarks Prefix"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "payout_credentials_section",
+   "fieldtype": "Section Break",
+   "label": "Payout API Credentials (Separate from BAV)"
+  },
+  {
+   "description": "Separate Client ID for Payout/Beneficiary/Transfer APIs",
+   "fieldname": "payout_client_id",
+   "fieldtype": "Data",
+   "label": "Payout Client ID"
+  },
+  {
+   "description": "Separate Client Secret for Payout APIs",
+   "fieldname": "payout_client_secret",
+   "fieldtype": "Password",
+   "label": "Payout Client Secret"
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-01-02 16:33:00.000000",
+ "modified": "2026-01-03 18:30:07.900459",
  "modified_by": "Administrator",
- "module": "Cashfree Integration",
+ "module": "CashFree Integration",
  "name": "Cashfree Settings",
  "owner": "Administrator",
  "permissions": [
@@ -138,6 +159,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": [],
