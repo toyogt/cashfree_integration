@@ -1,204 +1,175 @@
-# File: cashfree_integration/api/webhook.py
-# NOTE: File should be webhook.py (singular), not webhooks.py
-
 import frappe
 import json
 import hmac
 import hashlib
-from frappe import _
+import base64
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def cashfree_payout_webhook():
-    """
-    Handle Cashfree payout status webhooks
-    
-    Cashfree sends POST request with:
-    - Signature in header: x-webhook-signature
-    - Payload: JSON with event, data, timestamp
-    """
     try:
-        # Get raw data
-        if frappe.request.data:
-            data = json.loads(frappe.request.data)
-        else:
-            data = frappe.local.form_dict
-        
-        # Log all incoming webhooks
+        # === safe parse incoming body ===
+        raw_body = frappe.request.get_data(as_text=True)
+        content_type = frappe.get_request_header("content-type") or ""
+
+        try:
+            data = json.loads(raw_body) if raw_body else {}
+        except Exception:
+            data = dict(frappe.local.form_dict)
+
         frappe.log_error(
-            json.dumps(data, indent=2),
-            "Cashfree Webhook Received"
+            title="Cashfree Webhook Received",
+            message=json.dumps({
+                "content_type": content_type,
+                "raw_body": raw_body[:500],
+                "parsed_data": data
+            }, indent=2, default=str)
         )
-        
-        # ✅ SECURITY: Verify signature (recommended)
-        signature = frappe.get_request_header("x-webhook-signature") or ""
-        if signature:
-            if not verify_cashfree_signature(data, signature):
-                frappe.log_error("Invalid webhook signature", "Cashfree Webhook Security")
+
+        # === signature verification ===
+        sig_in_body = data.get("signature")
+        sig_in_header = frappe.get_request_header("x-webhook-signature")
+
+        if sig_in_body:
+            if not verify_cashfree_signature_v1(data, sig_in_body):
+                frappe.log_error("Invalid V1 signature", "Cashfree Webhook")
                 return {"status": "error", "message": "Invalid signature"}
-        
-        # Extract transfer details
-        event = data.get("event", "")
-        transfer_data = data.get("data", {})
-        
-        transfer_id = transfer_data.get("transfer_id") or data.get("transfer_id")
-        status = transfer_data.get("status") or data.get("status")
-        utr = transfer_data.get("utr") or data.get("utr")
-        failure_reason = transfer_data.get("reason") or transfer_data.get("failure_reason") or ""
-        
+        elif sig_in_header:
+            if not verify_cashfree_signature_v2(raw_body, sig_in_header):
+                frappe.log_error("Invalid V2 signature", "Cashfree Webhook")
+                return {"status": "error", "message": "Invalid signature"}
+
+        # === extract core fields ===
+        transfer_id = data.get("transferId") or data.get("transfer_id")
+        status = data.get("status")
+        utr = data.get("utr")
+        failure_reason = data.get("reason") or data.get("failure_reason") or ""
+
         if not transfer_id:
-            return {"status": "error", "message": "No transfer_id in webhook"}
-        
-        # Find Payment Request
+            return {"status": "success", "message": "No transfer_id present"}
+
+        # === find Payment Request ===
         pr_exists = frappe.db.exists("Payment Request", transfer_id)
-        
+
         if not pr_exists:
-            # Try by custom_cashfree_payout_id
             pr_list = frappe.db.sql("""
                 SELECT name FROM `tabPayment Request`
                 WHERE custom_cashfree_payout_id = %s
                 LIMIT 1
             """, (transfer_id,), as_dict=True)
-            
+
             if pr_list:
                 transfer_id = pr_list[0].name
             else:
                 frappe.log_error(
-                    f"Payment Request not found: {transfer_id}\nWebhook data: {json.dumps(data, indent=2)}",
+                    f"Payment Request not found: {transfer_id}",
                     "Cashfree Webhook - PR Not Found"
                 )
                 return {"status": "error", "message": "Payment Request not found"}
-        
-        # Map Cashfree status to ERPNext status
+
+        # === map status ===
         status_mapping = {
             "SUCCESS": "Success",
             "FAILED": "Failed",
             "REVERSED": "Reversed",
             "PENDING": "Pending",
-            "RECEIVED": "Pending",
             "ERROR": "Failed"
         }
-        
+
         new_status = status_mapping.get(str(status).upper(), "Pending")
-        
-        # Update Payment Request
-        update_fields = {
-            "custom_reconciliation_status": new_status
-        }
-        
+
+        # === update Payment Request ===
+        update_fields = {"custom_reconciliation_status": new_status}
         if utr:
             update_fields["custom_utr_number"] = utr
-        
-        if failure_reason and new_status == "Failed":
+        if failure_reason:
             update_fields["custom_failure_reason"] = failure_reason
-        
-        # Build SQL UPDATE query
+
         set_clause = ", ".join([f"{k} = %s" for k in update_fields.keys()])
         values = list(update_fields.values()) + [transfer_id]
-        
+
         frappe.db.sql(f"""
             UPDATE `tabPayment Request`
             SET {set_clause}
             WHERE name = %s
         """, tuple(values))
-        
-        # Update Cashfree Payout Log
+
+        # === update Cashfree Payout Log ===
         frappe.db.sql("""
             UPDATE `tabCashfree Payout Log`
-            SET 
-                status = %s,
-                response_payload = %s,
-                modified = NOW()
+            SET status = %s, response_payload = %s, modified = NOW()
             WHERE payment_request = %s
-        """, (new_status, json.dumps(transfer_data), transfer_id))
-        
-        # ✅ AUTO-CREATE PAYMENT ENTRY AS DRAFT ON SUCCESS
+        """, (new_status, json.dumps(data), transfer_id))
+
+        # === create draft Payment Entry on success ===
         pe_created = None
         if new_status == "Success":
             try:
-                pe_created = create_payment_entry_from_webhook(transfer_id, utr, transfer_data)
-            except Exception as pe_error:
-                frappe.log_error(
-                    f"Failed to create Payment Entry for {transfer_id}: {str(pe_error)}\n{frappe.get_traceback()}",
-                    "Webhook - PE Creation Failed"
-                )
-                # Don't fail the webhook - we can create PE manually later
-        
-        # Commit all changes
+                pe_created = create_payment_entry_from_webhook(transfer_id, utr, data)
+            except Exception as e:
+                frappe.log_error(str(e), "PE creation failed")
+
         frappe.db.commit()
-        
+
         return {
             "status": "success",
-            "message": "Webhook processed successfully",
             "transfer_id": transfer_id,
-            "payment_request": transfer_id,
             "new_status": new_status,
             "utr": utr,
-            "pe_created": pe_created is not None,
-            "payment_entry": pe_created
+            "pe_created": bool(pe_created)
         }
-        
+
     except Exception as e:
         frappe.db.rollback()
-        frappe.log_error(
-            title="Cashfree Webhook Error",
-            message=f"Error: {str(e)}\n\nWebhook Data: {json.dumps(data, indent=2) if 'data' in locals() else 'N/A'}\n\nTraceback: {frappe.get_traceback()}"
-        )
+        frappe.log_error(str(e), "Cashfree Webhook Handler Error")
         return {"status": "error", "message": str(e)}
 
 
-def verify_cashfree_signature(data, signature):
-    """
-    Verify webhook signature from Cashfree
-    
-    Cashfree signature format:
-    HMAC-SHA256(timestamp + json_data, client_secret)
-    """
+def verify_cashfree_signature_v1(data, received_signature):
+    """V1: sort params, concat values, HMAC, base64"""
     try:
-        settings = frappe.get_single("Cashfree Settings")
-        
-        # FIXED: Use get_password correctly
         from frappe.utils.password import get_decrypted_password
         secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
-        
         if not secret:
-            frappe.log_error("Client secret not found", "Webhook Signature Error")
             return False
-        
-        # Cashfree sends timestamp in data
-        timestamp = str(data.get("timestamp", ""))
-        payload_json = json.dumps(data.get("data", {}), separators=(',', ':'), sort_keys=True)
-        
-        # Construct payload
-        payload = timestamp + payload_json
-        
-        # Compute signature
-        computed_signature = hmac.new(
-            secret.encode(),
-            payload.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        
-        # Compare signatures (timing-safe)
-        return hmac.compare_digest(computed_signature, signature)
-    
+
+        stripped = {k: v for k, v in data.items() if k != "signature"}
+        sorted_keys = sorted(stripped.keys())
+        payload = "".join(str(stripped[k]) for k in sorted_keys)
+
+        computed = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
+        computed_signature = base64.b64encode(computed).decode()
+
+        return hmac.compare_digest(computed_signature, received_signature)
+
     except Exception as e:
-        frappe.log_error(f"Signature verification error: {str(e)}", "Webhook Signature Error")
+        frappe.log_error(str(e), "V1 signature verify error")
         return False
 
 
+def verify_cashfree_signature_v2(raw_body, received_signature):
+    """V2: HMAC(timestamp + raw_body), base64"""
+    try:
+        from frappe.utils.password import get_decrypted_password
+        secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
+        if not secret:
+            return False
+
+        timestamp = frappe.get_request_header("x-webhook-timestamp") or ""
+        payload = timestamp + raw_body
+        
+        computed = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
+        computed_signature = base64.b64encode(computed).decode()
+        
+        return hmac.compare_digest(computed_signature, received_signature)
+        
+    except Exception as e:
+        frappe.log_error(str(e), "V2 signature verify error")
+        return False
 def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     """
     Create Payment Entry as DRAFT (NOT submitted) for manual review
     SMART ALLOCATION: Allocates to PO/PI only if outstanding exists
-    
-    Args:
-        payment_request_name: Payment Request name
-        utr: UTR number from Cashfree
-        transfer_data: Full transfer data from webhook
-    
-    Returns:
-        Payment Entry name if created, None otherwise
     """
     # Get Payment Request details
     pr = frappe.db.get_value(
@@ -275,72 +246,54 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     pe.payment_request = payment_request_name
     
     # SMART REFERENCE ALLOCATION
-    reference_allocated = False
     allocation_note = ""
     
     if pr.reference_doctype and pr.reference_name:
         try:
             if pr.reference_doctype == "Purchase Order":
-                # Get PO details
                 po = frappe.get_doc("Purchase Order", pr.reference_name)
-                
-                # Calculate outstanding
                 outstanding = po.grand_total - (po.advance_paid or 0)
                 
                 if outstanding > 0:
-                    # Allocate up to outstanding amount
                     allocated_amt = min(pr.grand_total, outstanding)
-                    
                     pe.append("references", {
                         "reference_doctype": pr.reference_doctype,
                         "reference_name": pr.reference_name,
                         "allocated_amount": allocated_amt
                     })
                     
-                    reference_allocated = True
-                    
-                    # Note for remarks
                     if allocated_amt < pr.grand_total:
                         advance_amt = pr.grand_total - allocated_amt
-                        allocation_note = f"\n\n⚠️ PARTIAL ALLOCATION:\n- Allocated to PO: ₹{allocated_amt}\n- Advance/Unallocated: ₹{advance_amt}"
+                        allocation_note = f"\n\n⚠️ PARTIAL ALLOCATION:\n- Allocated to PO: ₹{allocated_amt}\n- Advance: ₹{advance_amt}"
                     else:
                         allocation_note = f"\n✅ Fully allocated to {pr.reference_doctype}: {pr.reference_name}"
                 else:
-                    allocation_note = f"\n⚠️ NOT ALLOCATED: {pr.reference_doctype} {pr.reference_name} has no outstanding amount.\nFull ₹{pr.grand_total} recorded as advance payment."
+                    allocation_note = f"\n⚠️ NOT ALLOCATED: PO has no outstanding. Full ₹{pr.grand_total} recorded as advance."
                     
             elif pr.reference_doctype == "Purchase Invoice":
-                # Get PI outstanding
-                outstanding = frappe.db.get_value(
-                    "Purchase Invoice",
-                    pr.reference_name,
-                    "outstanding_amount"
-                )
+                outstanding = frappe.db.get_value("Purchase Invoice", pr.reference_name, "outstanding_amount")
                 
                 if outstanding and outstanding > 0:
                     allocated_amt = min(pr.grand_total, outstanding)
-                    
                     pe.append("references", {
                         "reference_doctype": pr.reference_doctype,
                         "reference_name": pr.reference_name,
                         "allocated_amount": allocated_amt
                     })
                     
-                    reference_allocated = True
-                    
                     if allocated_amt < pr.grand_total:
                         advance_amt = pr.grand_total - allocated_amt
-                        allocation_note = f"\n\n⚠️ PARTIAL ALLOCATION:\n- Allocated to PI: ₹{allocated_amt}\n- Advance/Unallocated: ₹{advance_amt}"
+                        allocation_note = f"\n\n⚠️ PARTIAL ALLOCATION:\n- Allocated to PI: ₹{allocated_amt}\n- Advance: ₹{advance_amt}"
                     else:
                         allocation_note = f"\n✅ Fully allocated to {pr.reference_doctype}: {pr.reference_name}"
                 else:
-                    allocation_note = f"\n⚠️ NOT ALLOCATED: Purchase Invoice already paid.\nFull ₹{pr.grand_total} recorded as advance payment."
+                    allocation_note = f"\n⚠️ NOT ALLOCATED: PI already paid. Full ₹{pr.grand_total} recorded as advance."
                     
         except Exception as ref_error:
-            # Don't fail PE creation if reference allocation fails
-            allocation_note = f"\n❌ Reference allocation failed: {str(ref_error)}\nPayment recorded as advance - manual allocation required."
+            allocation_note = f"\n❌ Reference allocation failed: {str(ref_error)}\nPayment recorded as advance."
             frappe.logger().error(f"Reference allocation error: {str(ref_error)}")
     
-    # Enhanced remarks with allocation details
+    # Enhanced remarks
     pe.remarks = (
         f"Payment via Cashfree Payout\n"
         f"Payment Request: {payment_request_name}\n"
@@ -350,7 +303,7 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
         f"{allocation_note}"
     )
     
-    # Cost Center (if available)
+    # Cost Center
     if pr.cost_center:
         pe.cost_center = pr.cost_center
     
@@ -359,46 +312,33 @@ def create_payment_entry_from_webhook(payment_request_name, utr, transfer_data):
     pe.flags.ignore_mandatory = True
     pe.insert()
     
-    # Log PE creation
-    frappe.logger().info(
-        f"✅ Payment Entry {pe.name} created as DRAFT for PR {payment_request_name}"
-    )
+    frappe.logger().info(f"✅ Payment Entry {pe.name} created as DRAFT for PR {payment_request_name}")
     
     # Notify accountant
     try:
         notify_accountant_for_review(pe.name, payment_request_name, utr, pr.grand_total)
     except:
-        pass  # Don't fail if notification fails
+        pass
     
-    # ✅ Notify vendor about payment
+    # Notify vendor
     try:
         send_payment_notification_to_vendor(pe.name, pr.party, utr, pr.grand_total)
     except:
-        pass  # Don't fail if email fails
+        pass
     
     return pe.name
 
 
 def get_cashfree_bank_account(company):
-    """
-    Get Cashfree bank account for company
-    
-    Args:
-        company: Company name
-    
-    Returns:
-        Account name (full path like "Cashfree - KFPL")
-    """
-    # Try: "Cashfree - {Company Abbr}"
+    """Get Cashfree bank account for company"""
     company_abbr = frappe.get_cached_value("Company", company, "abbr")
     account_name = f"Cashfree - {company_abbr}"
     
     account = frappe.db.get_value("Account", account_name, "name")
-    
     if account:
         return account
     
-    # Fallback 1: Search by "Cashfree" only
+    # Fallback 1
     account = frappe.db.get_value("Account", {
         "account_name": "Cashfree",
         "company": company,
@@ -409,40 +349,23 @@ def get_cashfree_bank_account(company):
     if account:
         return account
     
-    # Fallback 2: Search with LIKE
+    # Fallback 2
     accounts = frappe.db.sql("""
-        SELECT name
-        FROM `tabAccount`
-        WHERE company = %s
-        AND account_type = 'Bank'
-        AND is_group = 0
-        AND account_name LIKE %s
-        LIMIT 1
+        SELECT name FROM `tabAccount`
+        WHERE company = %s AND account_type = 'Bank' AND is_group = 0
+        AND account_name LIKE %s LIMIT 1
     """, (company, "%Cashfree%"), as_dict=True)
     
     if accounts:
         return accounts[0].name
     
-    # Not found - log error
-    frappe.logger().error(
-        f"Cashfree bank account not found for company: {company}"
-    )
-    
+    frappe.logger().error(f"Cashfree bank account not found for company: {company}")
     return None
 
 
 def notify_accountant_for_review(pe_name, pr_name, utr, amount):
-    """
-    Notify accountant to review and submit Payment Entry
-    
-    Args:
-        pe_name: Payment Entry name
-        pr_name: Payment Request name
-        utr: UTR number
-        amount: Payment amount
-    """
+    """Notify accountant to review Payment Entry"""
     try:
-        # Get Accounts team users
         accountants = frappe.get_all("Has Role", 
             filters={"role": "Accounts Manager"},
             fields=["parent"]
@@ -452,39 +375,26 @@ def notify_accountant_for_review(pe_name, pr_name, utr, amount):
             frappe.publish_realtime(
                 event='msgprint',
                 message=f'<b>Payment Entry Created</b><br><br>'
-                        f'A new Payment Entry <b>{pe.name}</b> has been created from Cashfree webhook.<br><br>'
+                        f'Payment Entry <b>{pe_name}</b> created from Cashfree webhook.<br><br>'
                         f'<b>Details:</b><br>'
                         f'Payment Request: {pr_name}<br>'
                         f'UTR: {utr}<br>'
                         f'Amount: ₹{amount}<br><br>'
-                        f'⚠️ Please review and submit the Payment Entry.',
+                        f'⚠️ Please review and submit.',
                 user=acc.parent
             )
     except:
-        pass  # Fail silently
+        pass
 
 
 def send_payment_notification_to_vendor(pe_name, party, utr, amount):
-    """
-    ✅ Send email notification to vendor about payment
-    
-    Args:
-        pe_name: Payment Entry name
-        party: Supplier name
-        utr: UTR number
-        amount: Payment amount
-    
-    Returns:
-        bool: True if email sent successfully, False otherwise
-    """
+    """Send email notification to vendor"""
     try:
         pe = frappe.get_doc("Payment Entry", pe_name)
         
-        # FIXED: Get supplier email with fallback
         supplier_email = frappe.db.get_value("Supplier", party, "email_id")
         
         if not supplier_email:
-            # Try to get from contact
             contact = frappe.db.get_value("Dynamic Link", {
                 "link_doctype": "Supplier",
                 "link_name": party
@@ -494,21 +404,15 @@ def send_payment_notification_to_vendor(pe_name, party, utr, amount):
                 supplier_email = frappe.db.get_value("Contact", contact, "email_id")
         
         if not supplier_email:
-            frappe.logger().info(f"No email found for supplier {party}")
             return False
         
-        # Email subject
         subject = f"Payment Processed - {pe.company}"
         
-        # Email body (HTML)
         message = f"""
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2e7d32;">Payment Processed Successfully</h2>
-            
             <p>Dear <strong>{party}</strong>,</p>
-            
-            <p>We are pleased to inform you that your payment has been processed successfully through Cashfree.</p>
-            
+            <p>Your payment has been processed successfully through Cashfree.</p>
             <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
                 <tr style="background-color: #f5f5f5;">
                     <td style="padding: 10px; border: 1px solid #ddd;"><strong>Payment Entry</strong></td>
@@ -526,44 +430,28 @@ def send_payment_notification_to_vendor(pe_name, party, utr, amount):
                     <td style="padding: 10px; border: 1px solid #ddd;"><strong>Payment Date</strong></td>
                     <td style="padding: 10px; border: 1px solid #ddd;">{pe.posting_date}</td>
                 </tr>
-                <tr style="background-color: #f5f5f5;">
-                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Payment Mode</strong></td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{pe.mode_of_payment}</td>
-                </tr>
             </table>
-            
-            <p><strong>Note:</strong> The amount will be credited to your registered bank account within 24 hours.</p>
-            
-            <p>If you have any questions, please contact our accounts department.</p>
-            
+            <p><strong>Note:</strong> Amount will be credited within 24 hours.</p>
             <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
-            
             <p style="color: #666; font-size: 12px;">
-                This is an automated notification from {pe.company}.<br>
+                Automated notification from {pe.company}.<br>
                 Please do not reply to this email.
             </p>
         </div>
         """
         
-        # Send email
         frappe.sendmail(
             recipients=[supplier_email],
             subject=subject,
             message=message,
             reference_doctype="Payment Entry",
             reference_name=pe.name,
-            now=False  # FIXED: Queue email instead of sending immediately
+            now=False
         )
         
-        # Log success (use logger instead of error log)
-        frappe.logger().info(
-            f"✅ Payment notification queued for {supplier_email} (PE: {pe.name})"
-        )
-        
+        frappe.logger().info(f"✅ Payment notification queued for {supplier_email}")
         return True
         
     except Exception as e:
-        frappe.logger().error(
-            f"Failed to send email for PE {pe_name}: {str(e)}"
-        )
+        frappe.logger().error(f"Failed to send email: {str(e)}")
         return False
