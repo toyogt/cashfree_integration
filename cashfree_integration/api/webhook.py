@@ -1,3 +1,6 @@
+# File: cashfree_integration/api/webhook.py
+# Production-Ready Cashfree Payout Webhook Handler (Final Version)
+
 import frappe
 import json
 import hmac
@@ -11,6 +14,10 @@ import time
 def cashfree_payout_webhook():
     """
     Production-Ready Cashfree Webhook Handler
+    
+    Supports both:
+    - V1 webhooks (form-encoded)
+    - V2 webhooks (JSON)
     
     Flow:
     1. LOG RAW DATA (ALWAYS) - Insurance against data loss
@@ -32,11 +39,15 @@ def cashfree_payout_webhook():
         raw_body = frappe.request.get_data(as_text=True)
         headers = {k: v for k, v in dict(frappe.request.headers).items()}
         
-        # Parse JSON safely
-        try:
-            data = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError as e:
-            return {"status": "error", "message": "Invalid JSON payload"}, 400
+        # Parse incoming body safely (JSON or form-encoded)
+        if raw_body:
+            try:
+                data = json.loads(raw_body)
+            except Exception:
+                # Fallback to form-encoded (V1 webhooks)
+                data = dict(frappe.local.form_dict)
+        else:
+            data = dict(frappe.local.form_dict)
         
         # Extract transfer_id (idempotency key)
         transfer_id = data.get("transferId") or data.get("transfer_id")
@@ -95,14 +106,14 @@ def cashfree_payout_webhook():
         # ============================================
         # STEP 3: IGNORE NON-SUCCESS EVENTS
         # ============================================
-        if event_type != "TRANSFER_SUCCESS":
+        if event_type.upper() != "TRANSFER_SUCCESS":
             update_webhook_log(webhook_log, {
                 "status": "Ignored",
                 "error_log": f"Event type {event_type} not processed"
             })
             
             # Still update PR status for failed transfers
-            if transfer_id and event_type in ["TRANSFER_FAILED", "TRANSFER_REVERSED"]:
+            if transfer_id and event_type.upper() in ["TRANSFER_FAILED", "TRANSFER_REVERSED"]:
                 update_payment_request_status(transfer_id, event_type, data)
             
             return {"status": "ignored", "message": f"Event {event_type} not processed"}, 200
@@ -110,12 +121,18 @@ def cashfree_payout_webhook():
         # ============================================
         # STEP 4: EXTRACT PAYMENT DATA
         # ============================================
-        transfer_data = data.get("data", {}).get("transfer", {}) if "data" in data else data
+        # Handle both form-encoded (V1) and JSON (V2) webhooks
+        if "data" in data and isinstance(data["data"], dict):
+            # V2 JSON format: nested structure
+            transfer_data = data["data"].get("transfer") or data["data"]
+        else:
+            # V1 form-encoded: flat structure
+            transfer_data = data
         
         payment_data = {
-            "transfer_id": transfer_id,
+            "transfer_id": transfer_data.get("transferId") or transfer_data.get("transfer_id") or transfer_id,
             "utr": transfer_data.get("utr"),
-            "amount": float(transfer_data.get("amount", 0)),
+            "amount": float(transfer_data.get("amount", 0)) if transfer_data.get("amount") else 0,
             "status": transfer_data.get("transferStatus") or transfer_data.get("status"),
             "acknowledged_at": transfer_data.get("acknowledgedAt"),
             "processed_at": transfer_data.get("processedAt")
@@ -591,7 +608,7 @@ def update_payment_request_status(transfer_id, event_type, data):
             "TRANSFER_REVERSED": "Reversed"
         }
         
-        new_status = status_mapping.get(event_type, "Pending")
+        new_status = status_mapping.get(event_type.upper(), "Pending")
         failure_reason = data.get("reason") or data.get("failure_reason") or ""
         
         frappe.db.sql("""
@@ -642,7 +659,10 @@ def get_cashfree_bank_account(company):
 
 
 def verify_cashfree_signature_v1(data, received_signature):
-    """V1: sort params, concat values, HMAC, base64"""
+    """
+    V1: sort params, concat values, HMAC, base64
+    Excludes Frappe-added params (cmd, doctype)
+    """
     try:
         from frappe.utils.password import get_decrypted_password
         secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
@@ -655,7 +675,12 @@ def verify_cashfree_signature_v1(data, received_signature):
             )
             return False
 
-        stripped = {k: v for k, v in data.items() if k != "signature"}
+        # Exclude signature and Frappe-added params
+        stripped = {
+            k: v for k, v in data.items()
+            if k not in ("signature", "cmd", "doctype")
+        }
+
         sorted_keys = sorted(stripped.keys())
         payload = "".join(str(stripped[k]) for k in sorted_keys)
 
