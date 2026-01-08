@@ -434,3 +434,4 @@ Internal use for K95 Foods Pvt. Ltd.
 
 If you want, the next step can be drafting a separate `INTEGRATION_GUIDE.md` or `TROUBLESHOOTING.md` with concrete error examples and how to resolve them.
 
+Updated on Thu Jan  8 13:16:20 UTC 2026
