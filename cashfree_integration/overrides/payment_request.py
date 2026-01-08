@@ -105,10 +105,17 @@ def validate_director_override(doc, method=None):
                 )
     
     except frappe.DoesNotExistError:
+        # PO not found - let it pass (will be caught elsewhere)
         pass
+    
     except Exception as e:
-        frappe.log_error(str(e), "Director Override Validation Error")
-
+        # Shorten error title to avoid character limit
+        doc_ref = doc.name[:30] if doc.name else "Unknown"
+        error_title = f"Override Check Error - {doc_ref}"
+        frappe.log_error(
+            message=str(e),
+            title=error_title
+        )
 
 # Apply monkey patch
-PaymentRequest.validate = patched_validate
+#PaymentRequest.validate = patched_validate

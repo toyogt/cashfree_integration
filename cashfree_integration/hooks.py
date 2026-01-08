@@ -159,15 +159,17 @@ app_license = "mit"
 # DOCUMENT EVENTS
 # =============================================================================
 
-doc_events = {
-    "Payment Request": {
-        # Director Override pre-check
-        "before_validate": "cashfree_integration.overrides.payment_request.validate_director_override",
-        
-        # Trigger payout creation when workflow state changes
-        "on_update_after_submit": "cashfree_integration.api.payouts.trigger_payout_for_payment_request",
-    }
-}
+# =============================================================================
+# DOCUMENT EVENTS (DISABLED)
+# =============================================================================
+# Director override disabled - uncomment to enable later
+
+# doc_events = {
+#     "Payment Request": {
+#         "before_validate": "cashfree_integration.overrides.payment_request.validate_director_override",
+#         "on_update_after_submit": "cashfree_integration.api.payouts.trigger_payout_for_payment_request"
+#     }
+# }
 
 
 # Scheduled Tasks

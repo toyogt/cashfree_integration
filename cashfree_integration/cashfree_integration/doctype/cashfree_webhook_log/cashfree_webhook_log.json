@@ -1,0 +1,173 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:CWL-{YYYY}-{#####}",
+ "creation": "2026-01-07 13:30:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "transfer_id",
+  "webhook_event",
+  "status",
+  "column_break_4",
+  "payment_request",
+  "payment_entry",
+  "retry_count",
+  "section_break_8",
+  "raw_payload",
+  "signature",
+  "column_break_11",
+  "headers",
+  "section_break_13",
+  "validation_results",
+  "error_log",
+  "section_break_16",
+  "processed_at",
+  "processing_time"
+ ],
+ "fields": [
+  {
+   "fieldname": "transfer_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Transfer ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "webhook_event",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Webhook Event",
+   "options": "TRANSFER_SUCCESS\nTRANSFER_FAILED\nTRANSFER_REVERSED\nTRANSFER_ACKNOWLEDGED\nUNKNOWN"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Processing Status",
+   "options": "Received\nSignature Verified\nPE Draft Created\nValidation Passed\nPE Submitted\nValidation Failed\nSignature Failed\nError\nDuplicate",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_4",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "payment_request",
+   "fieldtype": "Link",
+   "label": "Payment Request",
+   "options": "Payment Request"
+  },
+  {
+   "fieldname": "payment_entry",
+   "fieldtype": "Link",
+   "label": "Payment Entry",
+   "options": "Payment Entry"
+  },
+  {
+   "fieldname": "retry_count",
+   "fieldtype": "Int",
+   "label": "Retry Count",
+   "default": "0"
+  },
+  {
+   "fieldname": "section_break_8",
+   "fieldtype": "Section Break",
+   "label": "Webhook Data"
+  },
+  {
+   "fieldname": "raw_payload",
+   "fieldtype": "Code",
+   "label": "Raw Payload",
+   "options": "JSON",
+   "reqd": 1
+  },
+  {
+   "fieldname": "signature",
+   "fieldtype": "Data",
+   "label": "Signature"
+  },
+  {
+   "fieldname": "column_break_11",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "headers",
+   "fieldtype": "Code",
+   "label": "Request Headers",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "section_break_13",
+   "fieldtype": "Section Break",
+   "label": "Processing Details"
+  },
+  {
+   "fieldname": "validation_results",
+   "fieldtype": "Code",
+   "label": "Validation Results",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "error_log",
+   "fieldtype": "Code",
+   "label": "Error Log"
+  },
+  {
+   "fieldname": "section_break_16",
+   "fieldtype": "Section Break",
+   "label": "Timestamps"
+  },
+  {
+   "fieldname": "processed_at",
+   "fieldtype": "Datetime",
+   "label": "Processed At"
+  },
+  {
+   "fieldname": "processing_time",
+   "fieldtype": "Float",
+   "label": "Processing Time (seconds)",
+   "precision": "3"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-01-07 13:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Cashfree Integration",
+ "name": "Cashfree Webhook Log",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager",
+   "share": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

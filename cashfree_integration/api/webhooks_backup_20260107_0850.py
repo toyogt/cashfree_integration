@@ -17,13 +17,12 @@ def cashfree_payout_webhook():
     2. Signature Validation - Security
     3. Create PE in DRAFT - Smart recovery strategy
     4. Run Business Validations - Data integrity
-    5. Auto-submit if all pass, else keep draft for manual review
+    5. Auto-submit if all pass, else keep draft + alert admin
     
-    Monitoring: Check "Cashfree Webhook Log" list daily for failures
+    References: [web:400] [web:404]
     """
     start_time = time.time()
     webhook_log = None
-    transfer_id = None
     
     try:
         # ============================================
@@ -55,7 +54,7 @@ def cashfree_payout_webhook():
         frappe.logger().info(f"[Cashfree Webhook] Received: {transfer_id} | Event: {event_type}")
         
         # ============================================
-        # STEP 2: SIGNATURE VALIDATION (PRODUCTION SECURE)
+        # STEP 2: SIGNATURE VALIDATION
         # ============================================
         sig_in_body = data.get("signature")
         sig_in_header = headers.get("x-webhook-signature")
@@ -82,13 +81,16 @@ def cashfree_payout_webhook():
                 frappe.log_error("Invalid V2 signature", "Cashfree Webhook")
                 return {"status": "error", "message": "Invalid signature"}, 401
         else:
-            # PRODUCTION: Always require signature
-            update_webhook_log(webhook_log, {
-                "status": "Signature Failed",
-                "error_log": "No signature provided"
-            })
-            frappe.log_error("Webhook missing signature", "Cashfree Webhook Security")
-            return {"status": "error", "message": "Missing signature"}, 401
+            # No signature provided (only allow in development)
+            if frappe.conf.get("developer_mode"):
+                frappe.logger().warning("[Cashfree Webhook] No signature - DEV MODE ONLY")
+                signature_valid = True
+            else:
+                update_webhook_log(webhook_log, {
+                    "status": "Signature Failed",
+                    "error_log": "No signature provided"
+                })
+                return {"status": "error", "message": "Missing signature"}, 401
         
         update_webhook_log(webhook_log, {"status": "Signature Verified"})
         
@@ -141,14 +143,10 @@ def cashfree_payout_webhook():
         
     except Exception as e:
         error_trace = frappe.get_traceback()
-        
-        # Safe error title
-        try:
-            error_title = f"Cashfree Webhook Critical Error - {transfer_id}"
-        except:
-            error_title = "Cashfree Webhook Critical Error - Unknown Transfer"
-        
-        frappe.log_error(title=error_title, message=error_trace)
+        frappe.log_error(
+            title=f"Cashfree Webhook Critical Error - {transfer_id}",
+            message=error_trace
+        )
         
         if webhook_log:
             update_webhook_log(webhook_log, {
@@ -156,13 +154,16 @@ def cashfree_payout_webhook():
                 "error_log": error_trace
             })
         
+        # Alert admin immediately
+        notify_admin_critical_failure(transfer_id, error_trace)
+        
         return {"status": "error", "message": "Internal server error"}, 500
 
 
 def create_webhook_log(transfer_id, webhook_event, raw_payload, signature, headers, status):
     """
     Create webhook log - ALWAYS succeeds
-    Implements idempotency check
+    Implements idempotency check [web:404]
     """
     try:
         # Check if webhook already processed (idempotency)
@@ -217,7 +218,7 @@ def update_webhook_log(webhook_log, updates):
 def create_payment_entry_with_validation(payment_data, webhook_log):
     """
     Core logic: Create PE in DRAFT → Validate → Submit if all pass
-    All results logged to webhook_log for monitoring
+    [web:400] [web:404]
     """
     
     validation_results = {
@@ -265,7 +266,7 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                     "validation_results": json.dumps(validation_results, indent=2)
                 })
                 
-                frappe.logger().error(f"[Cashfree Webhook] Payment Request not found: {transfer_id}")
+                notify_admin_validation_failure(transfer_id, validation_results, webhook_log.name)
                 return {"status": "error", "message": "Payment Request not found"}, 404
         
         validation_results["passed"].append(f"Payment Request found: {pr_name.name}")
@@ -308,24 +309,6 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                 "check": "Cashfree Account",
                 "reason": f"Cashfree account not found for company {pr_name.company}"
             })
-            
-            # CRITICAL: Stop here - can't create PE without account
-            update_webhook_log(webhook_log, {
-                "status": "Validation Failed",
-                "validation_results": json.dumps(validation_results, indent=2)
-            })
-            
-            frappe.log_error(
-                f"Cashfree bank account missing for company: {pr_name.company}\n"
-                f"Create account: Chart of Accounts > Add 'Cashfree - {frappe.get_cached_value('Company', pr_name.company, 'abbr')}'",
-                "Cashfree Webhook - Missing Account"
-            )
-            
-            return {
-                "status": "error",
-                "message": "Cashfree account not configured",
-                "validation_failures": validation_results["failed"]
-            }, 500
         else:
             validation_results["passed"].append(f"Cashfree account: {cashfree_account}")
         
@@ -343,25 +326,6 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
             validation_results["warnings"].append("Using default payable account")
         else:
             validation_results["passed"].append(f"Supplier account: {supplier_account}")
-        
-        # ============================================
-        # VALIDATION 5: Check Mode of Payment
-        # ============================================
-        if not frappe.db.exists("Mode of Payment", "Cashfree"):
-            try:
-                mop = frappe.get_doc({
-                    "doctype": "Mode of Payment",
-                    "mode_of_payment": "Cashfree",
-                    "enabled": 1,
-                    "type": "Bank"
-                })
-                mop.insert(ignore_permissions=True)
-                frappe.db.commit()
-                frappe.logger().info("[Cashfree Webhook] Auto-created Mode of Payment: Cashfree")
-                validation_results["warnings"].append("Auto-created Mode of Payment: Cashfree")
-            except Exception as mop_error:
-                frappe.logger().error(f"Failed to create Mode of Payment: {str(mop_error)}")
-                validation_results["warnings"].append(f"Mode of Payment creation failed: {str(mop_error)}")
         
         # ============================================
         # CREATE PAYMENT ENTRY IN DRAFT
@@ -397,7 +361,7 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
         pe.reference_date = frappe.utils.today()
         
         # ============================================
-        # VALIDATION 6: Smart Allocation
+        # VALIDATION 5: Smart Allocation
         # ============================================
         allocation_note = ""
         
@@ -459,8 +423,11 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                         allocation_note = f"\n⚠️ PI already paid - Amount recorded as advance"
                         
             except Exception as ref_error:
-                validation_results["warnings"].append(f"Reference allocation failed: {str(ref_error)}")
-                allocation_note = f"\n⚠️ Allocation skipped: {str(ref_error)}"
+                validation_results["failed"].append({
+                    "check": "Reference Allocation",
+                    "reason": str(ref_error)
+                })
+                allocation_note = f"\n❌ Allocation failed: {str(ref_error)}"
                 frappe.logger().error(f"Reference allocation error: {str(ref_error)}")
         
         # Enhanced remarks
@@ -519,6 +486,9 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                 
                 frappe.logger().info(f"[Cashfree Webhook] ✅ PE submitted: {pe.name}")
                 
+                # Notify accountant (real-time notification only - NO EMAIL)
+                notify_accountant_pe_submitted(pe.name, pr_name.name, utr, amount)
+                
                 return {
                     "status": "success",
                     "payment_entry": pe.name,
@@ -527,7 +497,7 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                 }, 200
                 
             except Exception as submit_error:
-                # Submit failed - keep as draft
+                # Submit failed - keep as draft and alert
                 validation_results["failed"].append({
                     "check": "PE Submission",
                     "reason": str(submit_error)
@@ -539,7 +509,7 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                     "error_log": frappe.get_traceback()
                 })
                 
-                frappe.logger().error(f"[Cashfree Webhook] PE submission failed: {pe.name} - {str(submit_error)}")
+                notify_admin_draft_review(pe.name, transfer_id, validation_results, webhook_log.name)
                 
                 return {
                     "status": "partial_success",
@@ -554,7 +524,7 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
                 "validation_results": json.dumps(validation_results, indent=2)
             })
             
-            frappe.logger().warning(f"[Cashfree Webhook] PE kept in draft: {pe.name} - Validation failures: {len(validation_results['failed'])}")
+            notify_admin_draft_review(pe.name, transfer_id, validation_results, webhook_log.name)
             
             return {
                 "status": "partial_success",
@@ -578,9 +548,237 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
             message=error_trace
         )
         
-        frappe.logger().error(f"[Cashfree Webhook] Critical error for {transfer_id}: {str(e)}")
+        notify_admin_critical_failure(transfer_id, error_trace, webhook_log.name)
         
         return {"status": "error", "message": str(e)}, 500
+
+
+def notify_accountant_pe_submitted(pe_name, pr_name, utr, amount):
+    """
+    Real-time notification ONLY (NO EMAIL)
+    Notify users with "Accountant" role via bell icon
+    """
+    try:
+        accountants = frappe.get_all("Has Role", 
+            filters={"role": "Accountant"},
+            fields=["parent"]
+        )
+        
+        for acc in accountants:
+            frappe.publish_realtime(
+                event='msgprint',
+                message=f'<b>✅ Payment Entry Auto-Submitted</b><br><br>'
+                        f'Payment Entry <b>{pe_name}</b> created from Cashfree webhook.<br><br>'
+                        f'<b>Details:</b><br>'
+                        f'Payment Request: {pr_name}<br>'
+                        f'UTR: {utr}<br>'
+                        f'Amount: ₹{amount:,.2f}<br><br>'
+                        f'<a href="/app/payment-entry/{pe_name}" target="_blank">View Payment Entry</a>',
+                user=acc.parent
+            )
+        
+        frappe.logger().info(f"[Cashfree Webhook] Notified {len(accountants)} accountants")
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to notify accountants: {str(e)}")
+
+
+def notify_admin_draft_review(pe_name, transfer_id, validation_results, webhook_log_name):
+    """
+    Alert admin when PE is in draft due to validation warnings/failures
+    Email notification for manual review
+    """
+    try:
+        failed_checks = validation_results.get("failed", [])
+        warnings = validation_results.get("warnings", [])
+        
+        message = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px;">
+            <h2 style="color: #ff9800;">⚠️ Payment Entry Requires Review</h2>
+            
+            <p>A Payment Entry was created in <strong>DRAFT</strong> status due to validation issues:</p>
+            
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr style="background-color: #f5f5f5;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Payment Entry</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{pe_name}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Transfer ID</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{transfer_id}</td>
+                </tr>
+                <tr style="background-color: #f5f5f5;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Webhook Log</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{webhook_log_name}</td>
+                </tr>
+            </table>
+            
+            <h3 style="color: #d32f2f;">❌ Failed Validations:</h3>
+            <ul style="color: #d32f2f;">
+                {"".join([f"<li><strong>{item['check']}:</strong> {item['reason']}</li>" for item in failed_checks])}
+            </ul>
+            
+            {"<h3 style='color: #ff9800;'>⚠️ Warnings:</h3><ul style='color: #ff9800;'>" + "".join([f"<li>{w}</li>" for w in warnings]) + "</ul>" if warnings else ""}
+            
+            <h3>📋 Action Required:</h3>
+            <ol>
+                <li>Review the Payment Entry details</li>
+                <li>Verify allocations and accounts</li>
+                <li>Submit manually if everything is correct</li>
+            </ol>
+            
+            <p>
+                <a href="/app/payment-entry/{pe_name}" 
+                   style="background-color: #2196f3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px 0;">
+                    Open Payment Entry
+                </a>
+                
+                <a href="/app/cashfree-webhook-log/{webhook_log_name}" 
+                   style="background-color: #607d8b; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px 0;">
+                    View Webhook Log
+                </a>
+            </p>
+            
+            <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
+            <p style="color: #666; font-size: 12px;">
+                Automated notification from Cashfree Webhook Handler<br>
+                Timestamp: {frappe.utils.now()}
+            </p>
+        </div>
+        """
+        
+        # Get admin emails
+        admin_emails = frappe.get_all("User", 
+            filters={"role_profile_name": ["in", ["System Manager", "Accounts Manager"]]},
+            fields=["email"]
+        )
+        
+        recipients = [u.email for u in admin_emails if u.email]
+        
+        if recipients:
+            frappe.sendmail(
+                recipients=recipients,
+                subject=f"⚠️ Draft PE Review Required: {pe_name}",
+                message=message,
+                reference_doctype="Payment Entry",
+                reference_name=pe_name,
+                now=False  # Queue for sending
+            )
+            
+            frappe.logger().info(f"[Cashfree Webhook] Draft review email sent to {len(recipients)} admins")
+        
+        # Also send real-time notification
+        for email in recipients:
+            frappe.publish_realtime(
+                event='msgprint',
+                message=f'⚠️ Draft PE {pe_name} requires review - Check email for details',
+                user=email
+            )
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to notify admin for draft review: {str(e)}")
+
+
+def notify_admin_validation_failure(transfer_id, validation_results, webhook_log_name):
+    """Alert admin when PE cannot be created at all"""
+    try:
+        failed_checks = validation_results.get("failed", [])
+        
+        message = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px;">
+            <h2 style="color: #d32f2f;">❌ Webhook Processing Failed</h2>
+            
+            <p>Critical validation failure - <strong>Payment Entry NOT created</strong>:</p>
+            
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr style="background-color: #f5f5f5;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Transfer ID</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{transfer_id}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Webhook Log</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{webhook_log_name}</td>
+                </tr>
+            </table>
+            
+            <h3>Failed Validations:</h3>
+            <ul style="color: #d32f2f;">
+                {"".join([f"<li><strong>{item['check']}:</strong> {item['reason']}</li>" for item in failed_checks])}
+            </ul>
+            
+            <p><strong>Raw webhook data preserved</strong> in Cashfree Webhook Log for manual processing.</p>
+            
+            <p>
+                <a href="/app/cashfree-webhook-log/{webhook_log_name}" 
+                   style="background-color: #d32f2f; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                    View Webhook Log
+                </a>
+            </p>
+        </div>
+        """
+        
+        admin_emails = frappe.get_all("User", 
+            filters={"role_profile_name": "System Manager"},
+            fields=["email"]
+        )
+        
+        recipients = [u.email for u in admin_emails if u.email]
+        
+        if recipients:
+            frappe.sendmail(
+                recipients=recipients,
+                subject=f"❌ Webhook Failed: {transfer_id}",
+                message=message,
+                now=False
+            )
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to notify admin of validation failure: {str(e)}")
+
+
+def notify_admin_critical_failure(transfer_id, error_trace, webhook_log_name=None):
+    """Alert for critical system errors"""
+    try:
+        message = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px;">
+            <h2 style="color: #d32f2f;">🚨 CRITICAL: Webhook System Error</h2>
+            
+            <p><strong>Unexpected error during webhook processing</strong></p>
+            
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr style="background-color: #f5f5f5;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><strong>Transfer ID</strong></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{transfer_id}</td>
+                </tr>
+                {"<tr><td style='padding: 10px; border: 1px solid #ddd;'><strong>Webhook Log</strong></td><td style='padding: 10px; border: 1px solid #ddd;'>" + webhook_log_name + "</td></tr>" if webhook_log_name else ""}
+            </table>
+            
+            <h3>Error Details:</h3>
+            <pre style="background-color: #f5f5f5; padding: 15px; overflow-x: auto; font-size: 12px;">{error_trace}</pre>
+            
+            <p><strong style="color: #4caf50;">✅ RAW DATA PRESERVED</strong> - Check Cashfree Webhook Log for recovery</p>
+            
+            {"<p><a href='/app/cashfree-webhook-log/" + webhook_log_name + "' style='background-color: #d32f2f; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;'>View Webhook Log</a></p>" if webhook_log_name else ""}
+        </div>
+        """
+        
+        admin_emails = frappe.get_all("User", 
+            filters={"role_profile_name": "System Manager"},
+            fields=["email"]
+        )
+        
+        recipients = [u.email for u in admin_emails if u.email]
+        
+        if recipients:
+            frappe.sendmail(
+                recipients=recipients,
+                subject=f"🚨 CRITICAL: Webhook Error - {transfer_id}",
+                message=message,
+                now=True  # Send immediately
+            )
+        
+    except Exception as e:
+        frappe.logger().error(f"Failed to notify admin of critical failure: {str(e)}")
 
 
 def update_payment_request_status(transfer_id, event_type, data):
@@ -646,13 +844,7 @@ def verify_cashfree_signature_v1(data, received_signature):
     try:
         from frappe.utils.password import get_decrypted_password
         secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
-        
         if not secret:
-            frappe.log_error(
-                "Cashfree client_secret not configured in Cashfree Settings. "
-                "Go to: Setup > Cashfree Settings > Client Secret",
-                "Cashfree Webhook - Missing Secret"
-            )
             return False
 
         stripped = {k: v for k, v in data.items() if k != "signature"}
@@ -674,13 +866,7 @@ def verify_cashfree_signature_v2(raw_body, received_signature):
     try:
         from frappe.utils.password import get_decrypted_password
         secret = get_decrypted_password("Cashfree Settings", "Cashfree Settings", "client_secret")
-        
         if not secret:
-            frappe.log_error(
-                "Cashfree client_secret not configured in Cashfree Settings. "
-                "Go to: Setup > Cashfree Settings > Client Secret",
-                "Cashfree Webhook - Missing Secret"
-            )
             return False
 
         timestamp = frappe.get_request_header("x-webhook-timestamp") or ""
