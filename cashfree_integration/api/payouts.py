@@ -224,6 +224,18 @@ def initiate_payout(doc, amount, bene_id, cf_manager, settings):
         
         frappe.logger().info(f"✅ Transfer initiated: {payout_id} - Status: {status}")
         
+        # ========================================
+        # ADD THESE 3 LINES (CRITICAL FOR WEBHOOK!)
+        # ========================================
+        frappe.db.set_value("Payment Request", doc.name, {
+            "custom_cashfree_payout_id": payout_id,      # Links webhook!
+            "custom_reconciliation_status": status       # Pending/Success
+        }, update_modified=False)
+        
+        frappe.db.commit()  # Ensure webhook sees it immediately
+        frappe.logger().info(f"🔗 PR Linked: {doc.name} ↔ {payout_id}")
+        # ========================================
+        
         return payout_id, status, result
         
     except Exception as e:
@@ -232,6 +244,7 @@ def initiate_payout(doc, amount, bene_id, cf_manager, settings):
             "Cashfree Transfer Error"
         )
         raise
+
 
 
 def trigger_payout_for_payment_request(doc, method=None):
