@@ -251,42 +251,66 @@ def create_payment_entry_with_validation(payment_data, webhook_log):
         # ============================================
         # VALIDATION 1: Find Payment Request
         # ============================================
-        pr_name = frappe.db.get_value(
-            "Payment Request",
-            {"name": transfer_id},
-            ["name", "party_type", "party", "grand_total", "company", "currency",
-             "reference_doctype", "reference_name", "mode_of_payment"],
-            as_dict=True
-        )
+        # ============================================
+# VALIDATION 1: Find Payment Request (FIXED)
+# ============================================
+pr_name = frappe.db.get_value(
+    "Payment Request",
+    {"name": transfer_id},
+    ["name", "party_type", "party", "grand_total", "company", "currency",
+     "reference_doctype", "reference_name", "mode_of_payment"],
+    as_dict=True
+)
+
+if not pr_name:
+    # 🔧 FIXED: Handle underscore vs dash mismatch
+    clean_transfer_id = transfer_id.replace("_", "-")
+    pr_name = frappe.db.get_value(
+        "Payment Request",
+        {"name": clean_transfer_id},
+        ["name", "party_type", "party", "grand_total", "company", "currency",
+         "reference_doctype", "reference_name", "mode_of_payment"],
+        as_dict=True
+    )
+    
+    if pr_name:
+        frappe.logger().info(f"[Webhook] Fixed underscore mismatch: {transfer_id} → {pr_name.name}")
+
+if not pr_name:
+    # Final fallback: custom payout ID
+    pr_list = frappe.db.sql("""
+        SELECT name, party_type, party, grand_total, company, currency,
+               reference_doctype, reference_name, mode_of_payment
+        FROM `tabPayment Request`
+        WHERE custom_cashfree_payout_id = %s
+        LIMIT 1
+    """, (transfer_id,), as_dict=True)
+    
+    if pr_list:
+        pr_name = pr_list[0]
+    else:
+        validation_results["failed"].append({
+            "check": "Payment Request Lookup",
+            "reason": f"PR not found for Transfer ID: {transfer_id} (tried: {clean_transfer_id})"
+        })
         
-        if not pr_name:
-            # Fallback: Check custom field
-            pr_list = frappe.db.sql("""
-                SELECT name, party_type, party, grand_total, company, currency,
-                       reference_doctype, reference_name, mode_of_payment
-                FROM `tabPayment Request`
-                WHERE custom_cashfree_payout_id = %s
-                LIMIT 1
-            """, (transfer_id,), as_dict=True)
-            
-            if pr_list:
-                pr_name = pr_list[0]
-            else:
-                validation_results["failed"].append({
-                    "check": "Payment Request Lookup",
-                    "reason": f"PR not found for Transfer ID: {transfer_id}"
-                })
-                
-                update_webhook_log(webhook_log, {
-                    "status": "Validation Failed",
-                    "validation_results": json.dumps(validation_results, indent=2)
-                })
-                
-                frappe.logger().error(f"[Cashfree Webhook] Payment Request not found: {transfer_id}")
-                return {"status": "error", "message": "Payment Request not found"}, 404
+        # Log all PRs with similar names for debugging
+        similar_prs = frappe.db.sql_list("""
+            SELECT name FROM `tabPayment Request`
+            WHERE name LIKE %s
+        """, (f"%{transfer_id.replace('_', '-')}%",))
+        frappe.logger().error(f"[Webhook] Similar PRs: {similar_prs}")
         
-        validation_results["passed"].append(f"Payment Request found: {pr_name.name}")
-        update_webhook_log(webhook_log, {"payment_request": pr_name.name})
+        update_webhook_log(webhook_log, {
+            "status": "Validation Failed",
+            "validation_results": json.dumps(validation_results, indent=2)
+        })
+        
+        return {"status": "error", "message": "Payment Request not found"}, 404
+
+validation_results["passed"].append(f"Payment Request found: {pr_name.name}")
+update_webhook_log(webhook_log, {"payment_request": pr_name.name})
+
         
         # ============================================
         # VALIDATION 2: Check for Duplicate PE
