@@ -297,9 +297,13 @@ def find_payment_request(transfer_id):
 
 
 def get_cashfree_account(company):
-    """Get Cashfree bank account for company"""
-    abbr = frappe.get_cached_value("Company", company, "abbr")
-    return frappe.db.get_value("Account", {"account_name": f"Cashfree - {abbr}", "company": company})
+    # SIMPLER - exact match first
+    account = frappe.db.get_value("Account", {
+        "name": ["like", "Cashfree%"],
+        "company": company
+    }, "name")
+    return account or None  # Returns "Cashfree - KFPL"
+
 
 
 def get_party_account(party, company):
@@ -379,12 +383,12 @@ def create_webhook_log(transfer_id, webhook_event, raw_payload, signature, times
     return log
 
 
-def update_webhook_log(webhook_log, updates):
-    """Batch update webhook log"""
-    if not webhook_log:
-        return
-    update_dict = {}
-    for k, v in updates.items():
-        update_dict[k] = str(v)[:1000] if isinstance(v, str) else v  # Truncate long strings
+def update_webhook_log(webhook_log, updates):  # line ~385
+    if isinstance(webhook_log, str):
+        webhook_log = frappe.get_doc("Cashfree Webhook Log", webhook_log)
     
-    webhook_log.db_set_multiple(update_dict, update_modified=False)
+    for field, value in updates.items():
+        webhook_log.set(field, str(value)[:1000] if isinstance(value, str) else value)
+    webhook_log.save(ignore_permissions=True)
+    return webhook_log.name
+
